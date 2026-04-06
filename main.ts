@@ -727,11 +727,6 @@ class HtmlPreviewView extends FileView {
       window.open(input);
       return;
     }
-    // Bare domain (e.g. "google.com"): open in browser with https
-    if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}/.test(input) && !input.includes("/") || /^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}\//.test(input)) {
-      window.open("https://" + input);
-      return;
-    }
     // Vault-relative path
     const url = this.server.getFileUrl(input);
     this.loadingEl?.addClass("is-active");
