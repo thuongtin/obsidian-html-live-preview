@@ -77,7 +77,8 @@
   background-color: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-s);
-  overflow: hidden;
+  overflow: visible;
+  position: relative;
   cursor: pointer;
   transition: border-color 0.15s, box-shadow 0.15s;
   min-width: 0;
@@ -108,6 +109,8 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex: 1;
 }
 
 .html-preview-url-input {
@@ -122,6 +125,47 @@
   margin: 0;
   min-width: 0;
 }
+
+/* ── URL autocomplete dropdown ── */
+
+.html-preview-url-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+}
+
+.html-preview-url-dropdown-item {
+  padding: 6px 10px;
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.html-preview-url-dropdown-item:hover,
+.html-preview-url-dropdown-item.is-selected {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.html-preview-url-dropdown-item strong {
+  color: var(--interactive-accent);
+  font-weight: 600;
+}
+
 
 /* ── Separator ── */
 

@@ -534,7 +534,7 @@ class HtmlPreviewView extends FileView {
 
     this.createToolbarBtn(navGroup, "refresh-cw", "Reload", () => this.refreshIframe());
 
-    // [FIX #7] Editable URL bar - click to edit, Enter to navigate
+    // Editable URL bar with autocomplete for vault HTML files
     this.urlEl = toolbar.createDiv({ cls: "html-preview-url" });
     const urlIcon = this.urlEl.createSpan({ cls: "html-preview-url-icon" });
     setIcon(urlIcon, "globe");
@@ -543,10 +543,73 @@ class HtmlPreviewView extends FileView {
 
     const urlInput = this.urlEl.createEl("input", {
       cls: "html-preview-url-input",
-      attr: { type: "text", spellcheck: "false" },
+      attr: { type: "text", spellcheck: "false", autocomplete: "off" },
     });
     urlInput.style.display = "none";
     urlInput.value = file.path;
+
+    // Autocomplete dropdown
+    const dropdown = this.urlEl.createDiv({ cls: "html-preview-url-dropdown" });
+    let selectedIdx = -1;
+    let currentItems: HTMLElement[] = [];
+
+    const getHtmlFiles = (): string[] => {
+      return this.app.vault.getFiles()
+        .filter(f => f.extension === "html" || f.extension === "htm")
+        .map(f => f.path)
+        .sort();
+    };
+
+    const showDropdown = (query: string) => {
+      dropdown.empty();
+      currentItems = [];
+      selectedIdx = -1;
+      const q = query.toLowerCase();
+      const matches = getHtmlFiles().filter(p => p.toLowerCase().includes(q));
+      if (matches.length === 0) {
+        dropdown.style.display = "none";
+        return;
+      }
+      for (const m of matches.slice(0, 12)) {
+        const item = dropdown.createDiv({ cls: "html-preview-url-dropdown-item" });
+        // Highlight matching portion
+        const lowerM = m.toLowerCase();
+        const idx = lowerM.indexOf(q);
+        if (q && idx !== -1) {
+          item.appendText(m.slice(0, idx));
+          const mark = item.createEl("strong");
+          mark.textContent = m.slice(idx, idx + q.length);
+          item.appendText(m.slice(idx + q.length));
+        } else {
+          item.textContent = m;
+        }
+        item.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          urlInput.value = m;
+          dropdown.style.display = "none";
+          this.navigateToVaultPath(m);
+          urlText.style.display = "";
+          urlInput.style.display = "none";
+        });
+        currentItems.push(item);
+      }
+      dropdown.style.display = "block";
+    };
+
+    const hideDropdown = () => {
+      dropdown.style.display = "none";
+      selectedIdx = -1;
+      currentItems = [];
+    };
+
+    const updateSelection = () => {
+      currentItems.forEach((el, i) => {
+        el.toggleClass("is-selected", i === selectedIdx);
+      });
+      if (selectedIdx >= 0 && currentItems[selectedIdx]) {
+        currentItems[selectedIdx].scrollIntoView({ block: "nearest" });
+      }
+    };
 
     this.urlEl.addEventListener("click", (e) => {
       if (urlInput.style.display === "none") {
@@ -555,31 +618,58 @@ class HtmlPreviewView extends FileView {
         urlInput.value = urlText.textContent || "";
         urlInput.focus();
         urlInput.select();
+        showDropdown(urlInput.value);
         e.stopPropagation();
       }
     });
 
+    urlInput.addEventListener("input", () => {
+      showDropdown(urlInput.value.trim());
+    });
+
     urlInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
+      if (e.key === "ArrowDown") {
         e.preventDefault();
-        const newPath = urlInput.value.trim();
-        if (newPath && newPath !== urlText.textContent) {
-          this.navigateToVaultPath(newPath);
+        if (currentItems.length > 0) {
+          selectedIdx = Math.min(selectedIdx + 1, currentItems.length - 1);
+          updateSelection();
+        }
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (currentItems.length > 0) {
+          selectedIdx = Math.max(selectedIdx - 1, 0);
+          updateSelection();
+        }
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        let target: string;
+        if (selectedIdx >= 0 && currentItems[selectedIdx]) {
+          target = getHtmlFiles().filter(p =>
+            p.toLowerCase().includes(urlInput.value.trim().toLowerCase())
+          )[selectedIdx] || urlInput.value.trim();
+        } else {
+          target = urlInput.value.trim();
+        }
+        hideDropdown();
+        if (target) {
+          this.navigateToVaultPath(target);
         }
         urlText.style.display = "";
         urlInput.style.display = "none";
       } else if (e.key === "Escape") {
+        hideDropdown();
         urlText.style.display = "";
         urlInput.style.display = "none";
       }
     });
 
     urlInput.addEventListener("blur", () => {
+      hideDropdown();
       urlText.style.display = "";
       urlInput.style.display = "none";
     });
 
-    this.urlEl.setAttribute("aria-label", "Click to edit path");
+    this.urlEl.setAttribute("aria-label", "Click to search files");
 
     // Right group
     const rightGroup = toolbar.createDiv({ cls: "html-preview-toolbar-group" });
@@ -631,8 +721,19 @@ class HtmlPreviewView extends FileView {
   }
 
   // [FIX #7] Navigate to a vault-relative path
-  private navigateToVaultPath(vaultPath: string): void {
-    const url = this.server.getFileUrl(vaultPath);
+  private navigateToVaultPath(input: string): void {
+    // External URL: open in default browser
+    if (/^https?:\/\//i.test(input)) {
+      window.open(input);
+      return;
+    }
+    // Bare domain (e.g. "google.com"): open in browser with https
+    if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}/.test(input) && !input.includes("/") || /^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}\//.test(input)) {
+      window.open("https://" + input);
+      return;
+    }
+    // Vault-relative path
+    const url = this.server.getFileUrl(input);
     this.loadingEl?.addClass("is-active");
     if (this.iframeEl) this.iframeEl.src = url;
     this.pushHistory(url);
