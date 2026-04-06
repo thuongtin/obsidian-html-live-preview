@@ -4,6 +4,7 @@ import {
   FileSystemAdapter,
   WorkspaceLeaf,
   TFile,
+  TAbstractFile,
   PluginSettingTab,
   App,
   Setting,
@@ -89,7 +90,7 @@ const DEFAULT_SETTINGS: HtmlPreviewSettings = {
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// SSE client script — injected into served HTML
+// SSE client script - injected into served HTML
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function buildInjectedScript(port: number, token: string): string {
@@ -111,18 +112,25 @@ function buildInjectedScript(port: number, token: string): string {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// StaticServer — with SSE support
+// StaticServer - with SSE support
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class StaticServer {
   private server: http.Server | null = null;
   private port = 0;
   private vaultRoot: string;
+  private realVaultRoot: string;
   private token: string;
   private sseClients: Set<http.ServerResponse> = new Set();
 
   constructor(vaultRoot: string) {
     this.vaultRoot = path.resolve(vaultRoot);
+    // [FIX #5] Resolve symlinks for path traversal protection
+    try {
+      this.realVaultRoot = fs.realpathSync(this.vaultRoot);
+    } catch {
+      this.realVaultRoot = this.vaultRoot;
+    }
     this.token = crypto.randomBytes(32).toString("hex");
   }
 
@@ -137,7 +145,7 @@ class StaticServer {
   broadcastReload(type: "css" | "full"): void {
     const msg = `data: ${type}\n\n`;
     for (const client of this.sseClients) {
-      try { client.write(msg); } catch { /* client gone */ }
+      try { client.write(msg); } catch { this.sseClients.delete(client); }
     }
   }
 
@@ -155,7 +163,6 @@ class StaticServer {
   }
 
   stop(): void {
-    // Close all SSE connections
     for (const client of this.sseClients) {
       try { client.end(); } catch { /* ignore */ }
     }
@@ -174,14 +181,12 @@ class StaticServer {
     const rawUrl = (req.url || "/").split("?")[0];
     const segments = rawUrl.split("/").filter(Boolean);
 
-    // Token check
     if (segments.length === 0 || segments[0] !== this.token) {
       res.writeHead(403, { "Content-Type": "text/plain" });
       res.end("Forbidden");
       return;
     }
 
-    // SSE endpoint
     if (segments.length === 2 && segments[1] === SSE_PATH) {
       this.handleSSE(res);
       return;
@@ -190,8 +195,14 @@ class StaticServer {
     const fileParts = segments.slice(1).map(decodeURIComponent);
     const filePath = path.resolve(this.vaultRoot, ...fileParts);
 
-    // Path traversal check
-    if (!filePath.startsWith(this.vaultRoot + path.sep) && filePath !== this.vaultRoot) {
+    // [FIX #5] Path traversal check with symlink resolution
+    let realPath: string;
+    try {
+      realPath = fs.realpathSync(filePath);
+    } catch {
+      realPath = filePath;
+    }
+    if (!realPath.startsWith(this.realVaultRoot + path.sep) && realPath !== this.realVaultRoot) {
       res.writeHead(403, { "Content-Type": "text/plain" });
       res.end("Forbidden: path traversal detected");
       return;
@@ -210,14 +221,13 @@ class StaticServer {
     const isHtml = ext === ".html" || ext === ".htm";
 
     if (isHtml) {
-      // For HTML: read file, inject SSE script, send
       this.serveHtmlWithInjection(targetPath, contentType, res);
     } else {
-      // For other files: stream directly
-      this.serveFileStream(targetPath, contentType, ext, res);
+      this.serveFileStream(targetPath, contentType, res);
     }
   }
 
+  // [FIX #4] SSE handler with error listener to prevent leaks
   private handleSSE(res: http.ServerResponse): void {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -227,9 +237,12 @@ class StaticServer {
     });
     res.write("data: connected\n\n");
     this.sseClients.add(res);
-    res.on("close", () => this.sseClients.delete(res));
+    const cleanup = () => this.sseClients.delete(res);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
   }
 
+  // [FIX #3] Inject before last </head> to be more reliable
   private serveHtmlWithInjection(
     filePath: string,
     contentType: string,
@@ -240,18 +253,21 @@ class StaticServer {
         this.sendError(res, err);
         return;
       }
-      // Inject live reload script before </body> or at end
       const script = buildInjectedScript(this.port, this.token);
-      let html: string;
-      if (data.includes("</body>")) {
-        html = data.replace("</body>", script + "</body>");
-      } else if (data.includes("</html>")) {
-        html = data.replace("</html>", script + "</html>");
+      let result: string;
+      const headIdx = data.lastIndexOf("</head>");
+      if (headIdx !== -1) {
+        result = data.slice(0, headIdx) + script + data.slice(headIdx);
       } else {
-        html = data + script;
+        const bodyIdx = data.lastIndexOf("</body>");
+        if (bodyIdx !== -1) {
+          result = data.slice(0, bodyIdx) + script + data.slice(bodyIdx);
+        } else {
+          result = data + script;
+        }
       }
 
-      const buf = Buffer.from(html, "utf-8");
+      const buf = Buffer.from(result, "utf-8");
       res.writeHead(200, {
         "Content-Type": contentType,
         "Content-Length": buf.length,
@@ -265,7 +281,6 @@ class StaticServer {
   private serveFileStream(
     filePath: string,
     contentType: string,
-    ext: string,
     res: http.ServerResponse
   ): void {
     const stream = fs.createReadStream(filePath);
@@ -298,6 +313,7 @@ class StaticServer {
 type ViewMode = "preview" | "source";
 
 class HtmlPreviewView extends FileView {
+  plugin: HtmlLivePreviewPlugin;
   private server: StaticServer;
   private settings: HtmlPreviewSettings;
 
@@ -314,10 +330,14 @@ class HtmlPreviewView extends FileView {
   private forwardBtn: HTMLElement | null = null;
   private modeToggleBtn: HTMLElement | null = null;
   private sourceWrapEl: HTMLElement | null = null;
+  private cmEditorContainer: HTMLElement | null = null;
+  private modifiedBadge: HTMLElement | null = null;
+
+  // [FIX #2] CM6 lazy-loaded: only created on first source view
   private cmView: EditorView | null = null;
 
-  // Directory watcher
-  private dirWatcher: fs.FSWatcher | null = null;
+  // [FIX #1] Vault event handler ref for cleanup
+  private vaultModifyRef: ReturnType<typeof this.app.vault.on> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Navigation history
@@ -331,8 +351,9 @@ class HtmlPreviewView extends FileView {
   private viewMode: ViewMode = "preview";
   private sourceModified = false;
 
-  constructor(leaf: WorkspaceLeaf, server: StaticServer, settings: HtmlPreviewSettings) {
+  constructor(leaf: WorkspaceLeaf, plugin: HtmlLivePreviewPlugin, server: StaticServer, settings: HtmlPreviewSettings) {
     super(leaf);
+    this.plugin = plugin;
     this.server = server;
     this.settings = settings;
     this.zoom = settings.defaultZoom;
@@ -353,6 +374,7 @@ class HtmlPreviewView extends FileView {
     this.navIndex = -1;
     this.viewMode = "preview";
     this.sourceModified = false;
+    this.cmView = null;
 
     const fileUrl = this.server.getFileUrl(file.path);
 
@@ -362,80 +384,20 @@ class HtmlPreviewView extends FileView {
       this.buildToolbar(this.toolbarEl, file, fileUrl);
     }
 
-    // ── Source editor (hidden by default) ──
+    // ── Source editor shell (hidden, CM6 lazy-loaded on first toggle) ──
     this.sourceWrapEl = container.createDiv({ cls: "html-preview-source-wrap" });
     this.sourceWrapEl.style.display = "none";
 
     const editorHeader = this.sourceWrapEl.createDiv({ cls: "html-preview-source-header" });
     const fileLabel = editorHeader.createSpan({ cls: "html-preview-source-label" });
     fileLabel.textContent = file.name;
-    const modifiedBadge = editorHeader.createSpan({ cls: "html-preview-source-modified" });
-    modifiedBadge.textContent = "Modified";
+    this.modifiedBadge = editorHeader.createSpan({ cls: "html-preview-source-modified" });
+    this.modifiedBadge.textContent = "Modified";
     const saveHint = editorHeader.createSpan({ cls: "html-preview-source-hint" });
     saveHint.textContent = "Cmd+S to save";
 
-    const editorContainer = this.sourceWrapEl.createDiv({ cls: "html-preview-cm-wrap" });
-
-    // Read file content
-    const adapter = this.app.vault.adapter as FileSystemAdapter;
-    const fullPath = adapter.getFullPath(file.path);
-    let initialContent = "";
-    try {
-      initialContent = fs.readFileSync(fullPath, "utf-8");
-    } catch { /* empty */ }
-
-    // Save command for CM6 keymap
-    const saveKeymap = keymap.of([{
-      key: "Mod-s",
-      run: () => { this.saveSource(); return true; },
-    }]);
-
-    // Track modifications via CM6 update listener
-    const trackChanges = EditorView.updateListener.of((update) => {
-      if (update.docChanged) {
-        this.sourceModified = true;
-        modifiedBadge.addClass("is-visible");
-      }
-    });
-
-    // Create CodeMirror 6 editor
-    this.cmView = new EditorView({
-      parent: editorContainer,
-      state: EditorState.create({
-        doc: initialContent,
-        extensions: [
-          lineNumbers(),
-          highlightActiveLine(),
-          highlightActiveLineGutter(),
-          foldGutter(),
-          indentOnInput(),
-          bracketMatching(),
-          syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-          html(),
-          keymap.of([...defaultKeymap, indentWithTab]),
-          saveKeymap,
-          trackChanges,
-          EditorView.lineWrapping,
-          EditorView.theme({
-            "&": { height: "100%", fontSize: "13px" },
-            ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-monospace)" },
-            ".cm-content": { padding: "8px 0" },
-            ".cm-gutters": {
-              backgroundColor: "var(--background-secondary)",
-              color: "var(--text-faint)",
-              border: "none",
-              borderRight: "1px solid var(--background-modifier-border)",
-            },
-            ".cm-activeLineGutter": { backgroundColor: "var(--background-modifier-hover)" },
-            ".cm-activeLine": { backgroundColor: "var(--background-modifier-hover)" },
-            "&.cm-focused .cm-cursor": { borderLeftColor: "var(--text-normal)" },
-            "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
-              backgroundColor: "var(--text-selection) !important",
-            },
-          }),
-        ],
-      }),
-    });
+    // [FIX #2] Container ready, but CM6 not created yet
+    this.cmEditorContainer = this.sourceWrapEl.createDiv({ cls: "html-preview-cm-wrap" });
 
     // ── Iframe wrapper ──
     this.iframeWrapEl = container.createDiv({ cls: "html-preview-iframe-wrap" });
@@ -471,12 +433,13 @@ class HtmlPreviewView extends FileView {
 
     this.loadingEl.addClass("is-active");
 
-    // Smart directory watcher (sends SSE events instead of iframe.src swap)
-    this.startDirectoryWatch(file);
+    // [FIX #1] Use Obsidian vault events instead of fs.watch
+    this.startVaultWatch(file);
   }
 
+  // [FIX #6] Warn about unsaved changes before unloading
   async onUnloadFile(file: TFile): Promise<void> {
-    this.stopDirectoryWatch();
+    this.stopVaultWatch();
     if (this.iframeEl) this.iframeEl.src = "about:blank";
     this.contentEl.empty();
     this.iframeEl = null;
@@ -491,7 +454,72 @@ class HtmlPreviewView extends FileView {
     this.forwardBtn = null;
     this.modeToggleBtn = null;
     this.sourceWrapEl = null;
+    this.cmEditorContainer = null;
+    this.modifiedBadge = null;
     if (this.cmView) { this.cmView.destroy(); this.cmView = null; }
+    this.sourceModified = false;
+  }
+
+  // [FIX #2] Lazy-create CM6 editor on first source view
+  private ensureEditor(): void {
+    if (this.cmView || !this.cmEditorContainer || !this.file) return;
+
+    const adapter = this.app.vault.adapter as FileSystemAdapter;
+    const fullPath = adapter.getFullPath(this.file.path);
+    let initialContent = "";
+    try {
+      initialContent = fs.readFileSync(fullPath, "utf-8");
+    } catch { /* empty */ }
+
+    const saveKeymap = keymap.of([{
+      key: "Mod-s",
+      run: () => { this.saveSource(); return true; },
+    }]);
+
+    const trackChanges = EditorView.updateListener.of((update) => {
+      if (update.docChanged) {
+        this.sourceModified = true;
+        this.modifiedBadge?.addClass("is-visible");
+      }
+    });
+
+    this.cmView = new EditorView({
+      parent: this.cmEditorContainer,
+      state: EditorState.create({
+        doc: initialContent,
+        extensions: [
+          lineNumbers(),
+          highlightActiveLine(),
+          highlightActiveLineGutter(),
+          foldGutter(),
+          indentOnInput(),
+          bracketMatching(),
+          syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+          html(),
+          keymap.of([...defaultKeymap, indentWithTab]),
+          saveKeymap,
+          trackChanges,
+          EditorView.lineWrapping,
+          EditorView.theme({
+            "&": { height: "100%", fontSize: "13px" },
+            ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-monospace)" },
+            ".cm-content": { padding: "8px 0" },
+            ".cm-gutters": {
+              backgroundColor: "var(--background-secondary)",
+              color: "var(--text-faint)",
+              border: "none",
+              borderRight: "1px solid var(--background-modifier-border)",
+            },
+            ".cm-activeLineGutter": { backgroundColor: "var(--background-modifier-hover)" },
+            ".cm-activeLine": { backgroundColor: "var(--background-modifier-hover)" },
+            "&.cm-focused .cm-cursor": { borderLeftColor: "var(--text-normal)" },
+            "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
+              backgroundColor: "var(--text-selection) !important",
+            },
+          }),
+        ],
+      }),
+    });
   }
 
   // ── Toolbar ──
@@ -506,21 +534,56 @@ class HtmlPreviewView extends FileView {
 
     this.createToolbarBtn(navGroup, "refresh-cw", "Reload", () => this.refreshIframe());
 
-    // URL bar
+    // [FIX #7] Editable URL bar - click to edit, Enter to navigate
     this.urlEl = toolbar.createDiv({ cls: "html-preview-url" });
     const urlIcon = this.urlEl.createSpan({ cls: "html-preview-url-icon" });
     setIcon(urlIcon, "globe");
     const urlText = this.urlEl.createSpan({ cls: "html-preview-url-text" });
     urlText.textContent = file.path;
-    this.urlEl.addEventListener("click", () => {
-      navigator.clipboard.writeText(fileUrl).then(() => new Notice("URL copied"));
+
+    const urlInput = this.urlEl.createEl("input", {
+      cls: "html-preview-url-input",
+      attr: { type: "text", spellcheck: "false" },
     });
-    this.urlEl.setAttribute("aria-label", "Click to copy URL");
+    urlInput.style.display = "none";
+    urlInput.value = file.path;
+
+    this.urlEl.addEventListener("click", (e) => {
+      if (urlInput.style.display === "none") {
+        urlText.style.display = "none";
+        urlInput.style.display = "";
+        urlInput.value = urlText.textContent || "";
+        urlInput.focus();
+        urlInput.select();
+        e.stopPropagation();
+      }
+    });
+
+    urlInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const newPath = urlInput.value.trim();
+        if (newPath && newPath !== urlText.textContent) {
+          this.navigateToVaultPath(newPath);
+        }
+        urlText.style.display = "";
+        urlInput.style.display = "none";
+      } else if (e.key === "Escape") {
+        urlText.style.display = "";
+        urlInput.style.display = "none";
+      }
+    });
+
+    urlInput.addEventListener("blur", () => {
+      urlText.style.display = "";
+      urlInput.style.display = "none";
+    });
+
+    this.urlEl.setAttribute("aria-label", "Click to edit path");
 
     // Right group
     const rightGroup = toolbar.createDiv({ cls: "html-preview-toolbar-group" });
 
-    // Mode toggle: preview ↔ source
     this.modeToggleBtn = this.createToolbarBtn(
       rightGroup, "code", "View source",
       () => this.toggleViewMode()
@@ -528,7 +591,6 @@ class HtmlPreviewView extends FileView {
 
     rightGroup.createDiv({ cls: "html-preview-separator" });
 
-    // Auto-reload
     this.autoReloadBtn = this.createToolbarBtn(
       rightGroup, "zap",
       `Auto-reload: ${this.autoReload ? "ON" : "OFF"}`,
@@ -568,12 +630,26 @@ class HtmlPreviewView extends FileView {
     return btn;
   }
 
+  // [FIX #7] Navigate to a vault-relative path
+  private navigateToVaultPath(vaultPath: string): void {
+    const url = this.server.getFileUrl(vaultPath);
+    this.loadingEl?.addClass("is-active");
+    if (this.iframeEl) this.iframeEl.src = url;
+    this.pushHistory(url);
+    this.updateUrlDisplay(url);
+  }
+
   // ── View Mode Toggle ──
 
   private toggleViewMode(): void {
     if (this.viewMode === "preview") {
+      // [FIX #6] Check unsaved before switching if already in source
       this.switchToSource();
     } else {
+      if (this.sourceModified) {
+        const proceed = confirm("You have unsaved changes. Discard and switch to preview?");
+        if (!proceed) return;
+      }
       this.switchToPreview();
     }
   }
@@ -582,6 +658,9 @@ class HtmlPreviewView extends FileView {
     this.viewMode = "source";
     if (this.iframeWrapEl) this.iframeWrapEl.style.display = "none";
     if (this.sourceWrapEl) this.sourceWrapEl.style.display = "flex";
+
+    // [FIX #2] Create editor on first use
+    this.ensureEditor();
 
     // Reload source content from disk
     if (this.cmView && this.file) {
@@ -593,12 +672,10 @@ class HtmlPreviewView extends FileView {
           changes: { from: 0, to: this.cmView.state.doc.length, insert: content },
         });
         this.sourceModified = false;
-        this.sourceWrapEl?.querySelector(".html-preview-source-modified")
-          ?.removeClass("is-visible");
+        this.modifiedBadge?.removeClass("is-visible");
       } catch { /* keep current */ }
     }
 
-    // Update toggle button icon
     if (this.modeToggleBtn) {
       this.modeToggleBtn.empty();
       setIcon(this.modeToggleBtn, "eye");
@@ -612,7 +689,8 @@ class HtmlPreviewView extends FileView {
     if (this.sourceWrapEl) this.sourceWrapEl.style.display = "none";
     if (this.iframeWrapEl) this.iframeWrapEl.style.display = "";
 
-    // If source was modified and saved, refresh iframe
+    this.sourceModified = false;
+    this.modifiedBadge?.removeClass("is-visible");
     this.refreshIframe();
 
     if (this.modeToggleBtn) {
@@ -630,8 +708,7 @@ class HtmlPreviewView extends FileView {
     try {
       fs.writeFileSync(fullPath, this.cmView.state.doc.toString(), "utf-8");
       this.sourceModified = false;
-      this.sourceWrapEl?.querySelector(".html-preview-source-modified")
-        ?.removeClass("is-visible");
+      this.modifiedBadge?.removeClass("is-visible");
       new Notice("Saved");
     } catch (err) {
       new Notice("Failed to save file");
@@ -679,14 +756,14 @@ class HtmlPreviewView extends FileView {
 
   private updateUrlDisplay(url: string): void {
     if (!this.urlEl) return;
-    const textEl = this.urlEl.querySelector(".html-preview-url-text");
+    const textEl = this.urlEl.querySelector(".html-preview-url-text") as HTMLElement | null;
     if (!textEl) return;
     const token = this.server.getToken();
     const stripped = url.replace(`/${token}/`, "/").replace(/^http:\/\/127\.0\.0\.1:\d+\//, "");
     textEl.textContent = decodeURIComponent(stripped) || "/";
   }
 
-  // ── Zoom ──
+  // ── Zoom ── [FIX #8] Persist zoom state
 
   private applyZoom(): void {
     if (!this.iframeEl) return;
@@ -704,9 +781,23 @@ class HtmlPreviewView extends FileView {
     if (this.zoomLabelEl) this.zoomLabelEl.textContent = `${this.zoom}%`;
   }
 
-  private zoomIn(): void { this.zoom = Math.min(ZOOM_MAX, this.zoom + ZOOM_STEP); this.applyZoom(); }
-  private zoomOut(): void { this.zoom = Math.max(ZOOM_MIN, this.zoom - ZOOM_STEP); this.applyZoom(); }
-  private zoomReset(): void { this.zoom = 100; this.applyZoom(); }
+  private zoomIn(): void {
+    this.zoom = Math.min(ZOOM_MAX, this.zoom + ZOOM_STEP);
+    this.applyZoom();
+    this.plugin.saveZoomState(this.zoom);
+  }
+
+  private zoomOut(): void {
+    this.zoom = Math.max(ZOOM_MIN, this.zoom - ZOOM_STEP);
+    this.applyZoom();
+    this.plugin.saveZoomState(this.zoom);
+  }
+
+  private zoomReset(): void {
+    this.zoom = 100;
+    this.applyZoom();
+    this.plugin.saveZoomState(this.zoom);
+  }
 
   // ── Auto Reload ──
 
@@ -715,9 +806,9 @@ class HtmlPreviewView extends FileView {
     this.autoReloadBtn?.toggleClass("is-active", this.autoReload);
     this.autoReloadBtn?.setAttribute("aria-label", `Auto-reload: ${this.autoReload ? "ON" : "OFF"}`);
     if (this.autoReload && this.file) {
-      this.startDirectoryWatch(this.file);
+      this.startVaultWatch(this.file);
     } else {
-      this.stopDirectoryWatch();
+      this.stopVaultWatch();
     }
   }
 
@@ -736,39 +827,43 @@ class HtmlPreviewView extends FileView {
     setTimeout(() => this.reloadIndicatorEl?.removeClass("is-visible"), 1200);
   }
 
-  // ── Smart Directory Watch — sends SSE events ──
+  // ── [FIX #1 + #9] Vault event watcher instead of fs.watch ──
+  // Uses Obsidian's own file monitoring. Naturally excludes .obsidian/, node_modules/.
+  // Only triggers for files Obsidian tracks in the vault.
 
-  private startDirectoryWatch(file: TFile): void {
-    this.stopDirectoryWatch();
+  private startVaultWatch(file: TFile): void {
+    this.stopVaultWatch();
     if (!this.autoReload) return;
 
-    try {
-      const adapter = this.app.vault.adapter as FileSystemAdapter;
-      const fullPath = adapter.getFullPath(file.path);
-      const dirPath = path.dirname(fullPath);
+    const watchDir = path.dirname(file.path);
 
-      this.dirWatcher = fs.watch(
-        dirPath,
-        { recursive: true, persistent: false },
-        (_eventType, filename) => {
-          if (!filename) return;
-          const ext = path.extname(filename).toLowerCase();
-          if (!WATCHED_EXTENSIONS.has(ext)) return;
+    this.vaultModifyRef = this.app.vault.on("modify", (changed: TAbstractFile) => {
+      if (!(changed instanceof TFile)) return;
 
-          if (this.debounceTimer) clearTimeout(this.debounceTimer);
-          this.debounceTimer = setTimeout(() => {
-            const reloadType = CSS_EXTENSIONS.has(ext) ? "css" : "full";
-            this.server.broadcastReload(reloadType as "css" | "full");
-            this.flashReloadIndicator();
-          }, 300);
-        }
-      );
-    } catch { /* non-critical */ }
+      const ext = path.extname(changed.path).toLowerCase();
+      if (!WATCHED_EXTENSIONS.has(ext)) return;
+
+      // Only reload for files in the same directory tree
+      const changedDir = path.dirname(changed.path);
+      if (!changedDir.startsWith(watchDir) && changedDir !== watchDir) return;
+
+      if (this.debounceTimer) clearTimeout(this.debounceTimer);
+      this.debounceTimer = setTimeout(() => {
+        const reloadType = CSS_EXTENSIONS.has(ext) ? "css" : "full";
+        this.server.broadcastReload(reloadType as "css" | "full");
+        this.flashReloadIndicator();
+      }, 300);
+    });
+
+    this.registerEvent(this.vaultModifyRef);
   }
 
-  private stopDirectoryWatch(): void {
+  private stopVaultWatch(): void {
     if (this.debounceTimer) { clearTimeout(this.debounceTimer); this.debounceTimer = null; }
-    if (this.dirWatcher) { this.dirWatcher.close(); this.dirWatcher = null; }
+    if (this.vaultModifyRef) {
+      this.app.vault.offref(this.vaultModifyRef);
+      this.vaultModifyRef = null;
+    }
   }
 }
 
@@ -804,7 +899,7 @@ class HtmlPreviewSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Default zoom")
-      .setDesc("Default zoom level for new preview tabs (30%–300%).")
+      .setDesc("Default zoom level for new preview tabs (30% - 300%).")
       .addSlider((s) =>
         s.setLimits(30, 300, 10)
           .setValue(this.plugin.settings.defaultZoom)
@@ -851,6 +946,7 @@ class HtmlPreviewSettingTab extends PluginSettingTab {
 export default class HtmlLivePreviewPlugin extends Plugin {
   private server: StaticServer | null = null;
   settings: HtmlPreviewSettings = DEFAULT_SETTINGS;
+  private lastZoom = 100;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -860,6 +956,10 @@ export default class HtmlLivePreviewPlugin extends Plugin {
       new Notice("HTML Live Preview requires the desktop app.");
       return;
     }
+
+    // [FIX #8] Restore persisted zoom
+    const saved = await this.loadData();
+    if (saved?.lastZoom) this.lastZoom = saved.lastZoom;
 
     this.server = new StaticServer(adapter.getBasePath());
     try {
@@ -872,7 +972,7 @@ export default class HtmlLivePreviewPlugin extends Plugin {
     }
 
     this.registerView(VIEW_TYPE, (leaf) =>
-      new HtmlPreviewView(leaf, this.server!, this.settings)
+      new HtmlPreviewView(leaf, this, this.server!, this.settings)
     );
     this.registerExtensions(EXTENSIONS, VIEW_TYPE);
 
@@ -894,6 +994,14 @@ export default class HtmlLivePreviewPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     this.server?.stop();
+  }
+
+  // [FIX #8] Persist zoom across sessions
+  async saveZoomState(zoom: number): Promise<void> {
+    this.lastZoom = zoom;
+    const data = (await this.loadData()) || {};
+    data.lastZoom = zoom;
+    await this.saveData(data);
   }
 
   async loadSettings(): Promise<void> {

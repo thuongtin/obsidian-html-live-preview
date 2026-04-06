@@ -110,6 +110,19 @@
   white-space: nowrap;
 }
 
+.html-preview-url-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  color: var(--text-normal);
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+
 /* ── Separator ── */
 
 .html-preview-separator {
