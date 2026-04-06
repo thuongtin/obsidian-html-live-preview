@@ -1,20 +1,22 @@
 # HTML Live Preview for Obsidian
 
-Preview HTML files directly inside Obsidian with full CSS, JavaScript, and CDN support — powered by a local HTTP server.
+Preview HTML files directly inside Obsidian with full CSS, JavaScript, and CDN support, powered by a local HTTP server.
 
 ![Preview Mode](screenshots/preview.png)
 
 ## Features
 
-- **Full HTML rendering** — CSS, JavaScript, external CDN scripts all work out of the box
-- **Local HTTP server** — Serves files from your vault via `http://127.0.0.1`, so relative paths resolve correctly
-- **SSE-based live reload** — Automatically refreshes when you edit HTML, CSS, or JS files
-- **CSS hot-swap** — CSS changes apply instantly without losing JavaScript state
-- **Source editor** — Built-in CodeMirror 6 editor with HTML syntax highlighting, line numbers, and code folding
-- **Browser-like toolbar** — Back/forward navigation, URL bar, reload, zoom controls, open in browser
-- **Zoom controls** — 30% to 300% zoom with keyboard-friendly controls
-- **Token-based security** — Random 32-byte token prevents unauthorized access to vault files
-- **Path traversal protection** — Validates all file paths to prevent directory traversal attacks
+- **Full HTML rendering** - CSS, JavaScript, external CDN scripts all work out of the box
+- **Local HTTP server** - Serves files from your vault via `http://127.0.0.1`, so relative paths resolve correctly
+- **SSE-based live reload** - Automatically refreshes when you edit HTML, CSS, or JS files. Uses Obsidian's vault events for reliable cross-platform file monitoring
+- **CSS hot-swap** - CSS changes apply instantly without losing JavaScript state
+- **Source editor** - Built-in CodeMirror 6 editor with HTML syntax highlighting, line numbers, code folding, and bracket matching. Lazy-loaded on first use to save memory
+- **Editable URL bar** - Click the URL bar to type a vault path and navigate directly. Press Enter to load
+- **Browser-like toolbar** - Back/forward navigation, reload, zoom controls, open in browser
+- **Zoom controls** - 30% to 300% zoom, persisted across sessions
+- **Unsaved changes warning** - Confirms before discarding edits when switching from source to preview
+- **Token-based security** - Random 32-byte token prevents unauthorized access to vault files
+- **Path traversal protection** - Validates all file paths with symlink resolution to prevent directory traversal attacks
 
 ![Source Editor](screenshots/source-editor.png)
 
@@ -36,14 +38,15 @@ Preview HTML files directly inside Obsidian with full CSS, JavaScript, and CDN s
 
 ## Usage
 
-Click any `.html` or `.htm` file in the sidebar — it opens in a live preview tab.
+Click any `.html` or `.htm` file in the sidebar to open it in a live preview tab.
 
 **Toolbar controls:**
+
 | Button | Action |
 |--------|--------|
 | `< >` | Navigate back/forward |
 | Reload | Refresh the preview |
-| URL bar | Click to copy the local server URL |
+| URL bar | Click to edit path, Enter to navigate |
 | `</>` | Toggle between preview and source editor |
 | Zap | Toggle auto-reload on/off |
 | `- / +` | Zoom out/in (click percentage to reset) |
@@ -62,9 +65,9 @@ Click any `.html` or `.htm` file in the sidebar — it opens in a live preview t
 
 ## Security
 
-- The server binds to `127.0.0.1` only — not accessible from other machines
+- The server binds to `127.0.0.1` only, not accessible from other machines
 - Each session generates a random 32-byte hex token; all requests must include it
-- File paths are validated with `path.resolve()` to prevent directory traversal
+- File paths are validated with `path.resolve()` and `fs.realpathSync()` to block both path traversal and symlink escape
 - The iframe sandbox restricts what the previewed page can do
 
 ## Desktop only
