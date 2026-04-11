@@ -239,6 +239,29 @@
   background-color: white;
 }
 
+/* When a fixed device preset is selected, center the iframe with letterbox */
+.html-preview-iframe-wrap.html-preview-iframe-wrap-fixed {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 16px;
+  background:
+    repeating-linear-gradient(
+      45deg,
+      var(--background-primary) 0,
+      var(--background-primary) 10px,
+      var(--background-secondary) 10px,
+      var(--background-secondary) 20px
+    );
+}
+
+.html-preview-iframe-wrap.html-preview-iframe-wrap-fixed .html-preview-iframe {
+  box-shadow:
+    0 0 0 1px var(--background-modifier-border),
+    0 8px 24px rgba(0, 0, 0, 0.18);
+  border-radius: 4px;
+}
+
 /* ── Loading overlay ── */
 
 .html-preview-loading {

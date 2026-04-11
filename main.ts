@@ -9,6 +9,9 @@ import {
   App,
   Setting,
   Notice,
+  Modal,
+  Menu,
+  EventRef,
   setIcon,
 } from "obsidian";
 import * as http from "http";
@@ -72,31 +75,154 @@ const ZOOM_MIN = 30;
 const ZOOM_MAX = 300;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Device presets for responsive testing
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface DevicePreset {
+  id: string;
+  name: string;
+  width: number | null;
+  height: number | null;
+  icon: string;
+  category: "responsive" | "desktop" | "tablet" | "mobile";
+}
+
+const DEVICE_PRESETS: DevicePreset[] = [
+  { id: "full",     name: "Responsive", width: null, height: null, icon: "maximize-2", category: "responsive" },
+  { id: "desktop",  name: "Desktop",    width: 1440, height: 900,  icon: "monitor",    category: "desktop"    },
+  { id: "laptop",   name: "Laptop",     width: 1366, height: 768,  icon: "laptop",     category: "desktop"    },
+  { id: "tablet",   name: "Tablet",     width: 768,  height: 1024, icon: "tablet",     category: "tablet"     },
+  { id: "mobilel",  name: "Mobile L",   width: 414,  height: 896,  icon: "smartphone", category: "mobile"     },
+  { id: "mobile",   name: "Mobile M",   width: 375,  height: 667,  icon: "smartphone", category: "mobile"     },
+  { id: "mobiles",  name: "Mobile S",   width: 320,  height: 568,  icon: "smartphone", category: "mobile"     },
+];
+
+function findDevicePreset(id: string): DevicePreset {
+  return DEVICE_PRESETS.find((p) => p.id === id) ?? DEVICE_PRESETS[0];
+}
+
+function formatPresetLabel(preset: DevicePreset): string {
+  if (preset.width === null || preset.height === null) return preset.name;
+  return `${preset.name} ${preset.width}×${preset.height}`;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Settings
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+interface SandboxFlags {
+  scripts: boolean;
+  popups: boolean;
+  forms: boolean;
+  modals: boolean;
+  downloads: boolean;
+  topNavigation: boolean;
+  pointerLock: boolean;
+}
+
 interface HtmlPreviewSettings {
-  allowScripts: boolean;
+  sandboxFlags: SandboxFlags;
   showToolbar: boolean;
   autoReload: boolean;
   defaultZoom: number;
+  defaultDevice: string;
+  warnUnsavedClose: boolean;
+  verboseLogging: boolean;
+  alwaysOpenInNewTab: boolean;
 }
 
 const DEFAULT_SETTINGS: HtmlPreviewSettings = {
-  allowScripts: true,
+  sandboxFlags: {
+    scripts: true,
+    popups: true,
+    forms: true,
+    modals: true,
+    downloads: false,
+    topNavigation: false,
+    pointerLock: false,
+  },
   showToolbar: true,
   autoReload: true,
   defaultZoom: 100,
+  defaultDevice: "full",
+  warnUnsavedClose: true,
+  verboseLogging: false,
+  alwaysOpenInNewTab: false,
 };
 
+function buildSandboxValue(flags: SandboxFlags): string {
+  const parts = ["allow-same-origin"];
+  if (flags.scripts) parts.push("allow-scripts");
+  if (flags.popups) parts.push("allow-popups");
+  if (flags.forms) parts.push("allow-forms");
+  if (flags.modals) parts.push("allow-modals");
+  if (flags.downloads) parts.push("allow-downloads");
+  if (flags.topNavigation) parts.push("allow-top-navigation");
+  if (flags.pointerLock) parts.push("allow-pointer-lock");
+  return parts.join(" ");
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// SSE client script - injected into served HTML
+// Logger
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class Logger {
+  private prefix = "[HTML Live Preview]";
+  constructor(private getVerbose: () => boolean) {}
+  debug(...args: unknown[]): void {
+    if (this.getVerbose()) console.log(this.prefix, ...args);
+  }
+  info(...args: unknown[]): void { console.log(this.prefix, ...args); }
+  warn(...args: unknown[]): void { console.warn(this.prefix, ...args); }
+  error(...args: unknown[]): void { console.error(this.prefix, ...args); }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Confirm Modal (theme-aware replacement for window.confirm)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ConfirmModal extends Modal {
+  constructor(
+    app: App,
+    private modalTitle: string,
+    private message: string,
+    private confirmLabel: string,
+    private onConfirm: () => void,
+    private confirmIsWarning = true
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl, titleEl } = this;
+    titleEl.setText(this.modalTitle);
+    contentEl.createEl("p", { text: this.message });
+    const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+    const cancelBtn = buttons.createEl("button", { text: "Cancel" });
+    cancelBtn.addEventListener("click", () => this.close());
+    const confirmBtn = buttons.createEl("button", {
+      text: this.confirmLabel,
+      cls: this.confirmIsWarning ? "mod-warning" : "mod-cta",
+    });
+    confirmBtn.addEventListener("click", () => {
+      this.close();
+      this.onConfirm();
+    });
+    window.setTimeout(() => confirmBtn.focus(), 0);
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SSE client + keyboard + error forwarder script
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function buildInjectedScript(port: number, token: string): string {
   return `<script data-hlp-live>
 (function(){
-  var es=new EventSource("http://127.0.0.1:${port}/${token}/${SSE_PATH}");
+  var TOK="${token}";
+  var es=new EventSource("http://127.0.0.1:${port}/"+TOK+"/${SSE_PATH}");
   es.onmessage=function(e){
     if(e.data==="css"){
       document.querySelectorAll('link[rel="stylesheet"]').forEach(function(l){
@@ -107,8 +233,72 @@ function buildInjectedScript(port: number, token: string): string {
       location.reload();
     }
   };
+  function send(msg){try{window.parent.postMessage(msg,"*")}catch(e){}}
+  document.addEventListener("keydown",function(e){
+    if(e.metaKey||e.ctrlKey){
+      if(e.key==="w"){e.preventDefault();send({hlp:"close",tok:TOK});}
+      else if(e.key==="r"){e.preventDefault();send({hlp:"reload",tok:TOK});}
+      else if(e.key==="="||e.key==="+"){e.preventDefault();send({hlp:"zoomIn",tok:TOK});}
+      else if(e.key==="-"){e.preventDefault();send({hlp:"zoomOut",tok:TOK});}
+      else if(e.key==="0"){e.preventDefault();send({hlp:"zoomReset",tok:TOK});}
+      else if(e.key==="["){e.preventDefault();send({hlp:"back",tok:TOK});}
+      else if(e.key==="]"){e.preventDefault();send({hlp:"forward",tok:TOK});}
+    }
+  });
+  window.addEventListener("error",function(e){
+    send({hlp:"error",tok:TOK,msg:e.message||"Script error",src:e.filename||"",line:e.lineno||0,col:e.colno||0});
+  });
+  window.addEventListener("unhandledrejection",function(e){
+    var r=e.reason;
+    var msg="Unhandled promise rejection";
+    if(r){msg+=": "+(r&&r.message?r.message:String(r))}
+    send({hlp:"error",tok:TOK,msg:msg,src:"",line:0,col:0});
+  });
 })();
 </script>`;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Dependency parser (HTML → set of vault-relative paths)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function parseDependencies(htmlContent: string, htmlVaultPath: string): Set<string> {
+  const deps = new Set<string>();
+  deps.add(htmlVaultPath);
+
+  // Use POSIX paths inside the vault
+  const posixPath = htmlVaultPath.split(path.sep).join("/");
+  const baseDir = path.posix.dirname(posixPath);
+
+  const patterns = [
+    /<link[^>]+href=["']([^"']+)["']/gi,
+    /<script[^>]+src=["']([^"']+)["']/gi,
+    /<img[^>]+src=["']([^"']+)["']/gi,
+    /<source[^>]+src=["']([^"']+)["']/gi,
+    /<video[^>]+src=["']([^"']+)["']/gi,
+    /<audio[^>]+src=["']([^"']+)["']/gi,
+    /<iframe[^>]+src=["']([^"']+)["']/gi,
+    /url\(\s*["']?([^"')]+)["']?\s*\)/gi,
+    /@import\s+["']([^"']+)["']/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(htmlContent)) !== null) {
+      const raw = match[1];
+      if (!raw) continue;
+      if (/^(https?:|data:|\/\/|file:|blob:|mailto:|tel:|#|javascript:)/i.test(raw)) continue;
+      const cleanUrl = raw.split("?")[0].split("#")[0];
+      if (!cleanUrl) continue;
+      const resolved = cleanUrl.startsWith("/")
+        ? path.posix.normalize(cleanUrl.slice(1))
+        : path.posix.normalize(path.posix.join(baseDir, cleanUrl));
+      if (resolved && !resolved.startsWith("..")) {
+        deps.add(resolved);
+      }
+    }
+  }
+  return deps;
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -122,16 +312,17 @@ class StaticServer {
   private realVaultRoot: string;
   private token: string;
   private sseClients: Set<http.ServerResponse> = new Set();
+  private logger: Logger;
 
-  constructor(vaultRoot: string) {
+  constructor(vaultRoot: string, logger: Logger) {
     this.vaultRoot = path.resolve(vaultRoot);
-    // [FIX #5] Resolve symlinks for path traversal protection
     try {
       this.realVaultRoot = fs.realpathSync(this.vaultRoot);
     } catch {
       this.realVaultRoot = this.vaultRoot;
     }
     this.token = crypto.randomBytes(32).toString("hex");
+    this.logger = logger;
   }
 
   getPort(): number { return this.port; }
@@ -155,7 +346,7 @@ class StaticServer {
       this.server.listen(0, "127.0.0.1", () => {
         const addr = this.server!.address() as AddressInfo;
         this.port = addr.port;
-        console.log(`[HTML Live Preview] Server on port ${this.port}`);
+        this.logger.info(`Server listening on port ${this.port}`);
         resolve(this.port);
       });
       this.server.on("error", reject);
@@ -170,7 +361,7 @@ class StaticServer {
     if (this.server) {
       this.server.close();
       this.server = null;
-      console.log("[HTML Live Preview] Server stopped");
+      this.logger.info("Server stopped");
     }
   }
 
@@ -195,7 +386,6 @@ class StaticServer {
     const fileParts = segments.slice(1).map(decodeURIComponent);
     const filePath = path.resolve(this.vaultRoot, ...fileParts);
 
-    // [FIX #5] Path traversal check with symlink resolution
     let realPath: string;
     try {
       realPath = fs.realpathSync(filePath);
@@ -227,7 +417,6 @@ class StaticServer {
     }
   }
 
-  // [FIX #4] SSE handler with error listener to prevent leaks
   private handleSSE(res: http.ServerResponse): void {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -242,7 +431,6 @@ class StaticServer {
     res.on("error", cleanup);
   }
 
-  // [FIX #3] Inject before last </head> to be more reliable
   private serveHtmlWithInjection(
     filePath: string,
     contentType: string,
@@ -329,16 +517,19 @@ class HtmlPreviewView extends FileView {
   private backBtn: HTMLElement | null = null;
   private forwardBtn: HTMLElement | null = null;
   private modeToggleBtn: HTMLElement | null = null;
+  private deviceBtn: HTMLElement | null = null;
+  private copyBtn: HTMLElement | null = null;
   private sourceWrapEl: HTMLElement | null = null;
   private cmEditorContainer: HTMLElement | null = null;
   private modifiedBadge: HTMLElement | null = null;
 
-  // [FIX #2] CM6 lazy-loaded: only created on first source view
+  // CM6 lazy-loaded: only created on first source view
   private cmView: EditorView | null = null;
 
-  // [FIX #1] Vault event handler ref for cleanup
-  private vaultModifyRef: ReturnType<typeof this.app.vault.on> | null = null;
+  // Vault event handler ref for cleanup
+  private vaultModifyRef: EventRef | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private messageHandler: ((e: MessageEvent) => void) | null = null;
 
   // Navigation history
   private navHistory: string[] = [];
@@ -350,6 +541,8 @@ class HtmlPreviewView extends FileView {
   private autoReload = true;
   private viewMode: ViewMode = "preview";
   private sourceModified = false;
+  private currentDevice: DevicePreset = DEVICE_PRESETS[0];
+  private dependencies: Set<string> = new Set();
 
   constructor(leaf: WorkspaceLeaf, plugin: HtmlLivePreviewPlugin, server: StaticServer, settings: HtmlPreviewSettings) {
     super(leaf);
@@ -358,6 +551,7 @@ class HtmlPreviewView extends FileView {
     this.settings = settings;
     this.zoom = settings.defaultZoom;
     this.autoReload = settings.autoReload;
+    this.currentDevice = findDevicePreset(settings.defaultDevice);
   }
 
   getViewType(): string { return VIEW_TYPE; }
@@ -381,7 +575,7 @@ class HtmlPreviewView extends FileView {
     // ── Toolbar ──
     if (this.settings.showToolbar) {
       this.toolbarEl = container.createDiv({ cls: "html-preview-toolbar" });
-      this.buildToolbar(this.toolbarEl, file, fileUrl);
+      this.buildToolbar(this.toolbarEl, file);
     }
 
     // ── Source editor shell (hidden, CM6 lazy-loaded on first toggle) ──
@@ -396,7 +590,6 @@ class HtmlPreviewView extends FileView {
     const saveHint = editorHeader.createSpan({ cls: "html-preview-source-hint" });
     saveHint.textContent = "Cmd+S to save";
 
-    // [FIX #2] Container ready, but CM6 not created yet
     this.cmEditorContainer = this.sourceWrapEl.createDiv({ cls: "html-preview-cm-wrap" });
 
     // ── Iframe wrapper ──
@@ -406,16 +599,14 @@ class HtmlPreviewView extends FileView {
     const spinner = this.loadingEl.createDiv({ cls: "html-preview-spinner" });
     setIcon(spinner, "loader");
 
-    const sandboxValue = this.settings.allowScripts
-      ? "allow-scripts allow-same-origin allow-popups allow-forms allow-modals"
-      : "allow-same-origin";
+    const sandboxValue = buildSandboxValue(this.settings.sandboxFlags);
 
     this.iframeEl = this.iframeWrapEl.createEl("iframe", {
       cls: "html-preview-iframe",
       attr: { sandbox: sandboxValue, src: fileUrl },
     });
 
-    this.applyZoom();
+    this.applyDimensions();
     this.pushHistory(fileUrl);
 
     this.iframeEl.addEventListener("load", () => {
@@ -433,13 +624,55 @@ class HtmlPreviewView extends FileView {
 
     this.loadingEl.addClass("is-active");
 
-    // [FIX #1] Use Obsidian vault events instead of fs.watch
-    this.startVaultWatch(file);
+    // Message handler: only respond to OUR iframe
+    this.messageHandler = (e: MessageEvent) => {
+      if (!this.iframeEl) return;
+      if (e.source !== this.iframeEl.contentWindow) return;
+      const data = e.data as { hlp?: string; tok?: string; msg?: string; src?: string; line?: number; col?: number };
+      if (!data || data.tok !== this.server.getToken()) return;
+
+      switch (data.hlp) {
+        case "close":     this.closeTab(); break;
+        case "reload":    this.refreshIframe(); break;
+        case "zoomIn":    this.zoomIn(); break;
+        case "zoomOut":   this.zoomOut(); break;
+        case "zoomReset": this.zoomReset(); break;
+        case "back":      this.goBack(); break;
+        case "forward":   this.goForward(); break;
+        case "error": {
+          const loc = data.src ? ` (${data.src}:${data.line}:${data.col})` : "";
+          this.plugin.logger.error(`iframe: ${data.msg}${loc}`);
+          break;
+        }
+      }
+    };
+    window.addEventListener("message", this.messageHandler);
+
+    // Container-level keyboard fallback (when iframe is NOT focused)
+    this.registerDomEvent(this.contentEl, "keydown", (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      switch (e.key) {
+        case "w": e.preventDefault(); this.closeTab(); break;
+        case "r": e.preventDefault(); this.refreshIframe(); break;
+        case "=": case "+": e.preventDefault(); this.zoomIn(); break;
+        case "-": e.preventDefault(); this.zoomOut(); break;
+        case "0": e.preventDefault(); this.zoomReset(); break;
+        case "[": e.preventDefault(); this.goBack(); break;
+        case "]": e.preventDefault(); this.goForward(); break;
+      }
+    });
+
+    // Parse dependencies for accurate auto-reload
+    await this.refreshDependencies(file);
+    this.startVaultWatch();
   }
 
-  // [FIX #6] Warn about unsaved changes before unloading
-  async onUnloadFile(file: TFile): Promise<void> {
+  async onUnloadFile(_file: TFile): Promise<void> {
     this.stopVaultWatch();
+    if (this.messageHandler) {
+      window.removeEventListener("message", this.messageHandler);
+      this.messageHandler = null;
+    }
     if (this.iframeEl) this.iframeEl.src = "about:blank";
     this.contentEl.empty();
     this.iframeEl = null;
@@ -453,27 +686,31 @@ class HtmlPreviewView extends FileView {
     this.backBtn = null;
     this.forwardBtn = null;
     this.modeToggleBtn = null;
+    this.deviceBtn = null;
+    this.copyBtn = null;
     this.sourceWrapEl = null;
     this.cmEditorContainer = null;
     this.modifiedBadge = null;
     if (this.cmView) { this.cmView.destroy(); this.cmView = null; }
     this.sourceModified = false;
+    this.dependencies.clear();
   }
 
-  // [FIX #2] Lazy-create CM6 editor on first source view
-  private ensureEditor(): void {
+  // ── Lazy-create CM6 editor on first source view ──
+
+  private async ensureEditor(): Promise<void> {
     if (this.cmView || !this.cmEditorContainer || !this.file) return;
 
-    const adapter = this.app.vault.adapter as FileSystemAdapter;
-    const fullPath = adapter.getFullPath(this.file.path);
     let initialContent = "";
     try {
-      initialContent = fs.readFileSync(fullPath, "utf-8");
-    } catch { /* empty */ }
+      initialContent = await this.app.vault.read(this.file);
+    } catch (err) {
+      this.plugin.logger.error("Failed to read source:", err);
+    }
 
     const saveKeymap = keymap.of([{
       key: "Mod-s",
-      run: () => { this.saveSource(); return true; },
+      run: () => { void this.saveSource(); return true; },
     }]);
 
     const trackChanges = EditorView.updateListener.of((update) => {
@@ -524,15 +761,15 @@ class HtmlPreviewView extends FileView {
 
   // ── Toolbar ──
 
-  private buildToolbar(toolbar: HTMLElement, file: TFile, fileUrl: string): void {
+  private buildToolbar(toolbar: HTMLElement, file: TFile): void {
     const navGroup = toolbar.createDiv({ cls: "html-preview-toolbar-group" });
 
-    this.backBtn = this.createToolbarBtn(navGroup, "arrow-left", "Back", () => this.goBack());
-    this.forwardBtn = this.createToolbarBtn(navGroup, "arrow-right", "Forward", () => this.goForward());
+    this.backBtn = this.createToolbarBtn(navGroup, "arrow-left", "Back (Cmd+[)", () => this.goBack());
+    this.forwardBtn = this.createToolbarBtn(navGroup, "arrow-right", "Forward (Cmd+])", () => this.goForward());
     this.backBtn.addClass("is-disabled");
     this.forwardBtn.addClass("is-disabled");
 
-    this.createToolbarBtn(navGroup, "refresh-cw", "Reload", () => this.refreshIframe());
+    this.createToolbarBtn(navGroup, "refresh-cw", "Reload (Cmd+R)", () => this.refreshIframe());
 
     // Editable URL bar with autocomplete for vault HTML files
     this.urlEl = toolbar.createDiv({ cls: "html-preview-url" });
@@ -553,26 +790,18 @@ class HtmlPreviewView extends FileView {
     let selectedIdx = -1;
     let currentItems: HTMLElement[] = [];
 
-    const getHtmlFiles = (): string[] => {
-      return this.app.vault.getFiles()
-        .filter(f => f.extension === "html" || f.extension === "htm")
-        .map(f => f.path)
-        .sort();
-    };
-
     const showDropdown = (query: string) => {
       dropdown.empty();
       currentItems = [];
       selectedIdx = -1;
       const q = query.toLowerCase();
-      const matches = getHtmlFiles().filter(p => p.toLowerCase().includes(q));
+      const matches = this.plugin.getHtmlFiles().filter(p => p.toLowerCase().includes(q));
       if (matches.length === 0) {
         dropdown.style.display = "none";
         return;
       }
       for (const m of matches.slice(0, 12)) {
         const item = dropdown.createDiv({ cls: "html-preview-url-dropdown-item" });
-        // Highlight matching portion
         const lowerM = m.toLowerCase();
         const idx = lowerM.indexOf(q);
         if (q && idx !== -1) {
@@ -644,7 +873,7 @@ class HtmlPreviewView extends FileView {
         e.preventDefault();
         let target: string;
         if (selectedIdx >= 0 && currentItems[selectedIdx]) {
-          target = getHtmlFiles().filter(p =>
+          target = this.plugin.getHtmlFiles().filter(p =>
             p.toLowerCase().includes(urlInput.value.trim().toLowerCase())
           )[selectedIdx] || urlInput.value.trim();
         } else {
@@ -676,7 +905,20 @@ class HtmlPreviewView extends FileView {
 
     this.modeToggleBtn = this.createToolbarBtn(
       rightGroup, "code", "View source",
-      () => this.toggleViewMode()
+      () => void this.toggleViewMode()
+    );
+
+    // Device preset selector
+    this.deviceBtn = this.createToolbarBtn(
+      rightGroup, "monitor", `Viewport: ${formatPresetLabel(this.currentDevice)}`,
+      () => this.showDeviceMenu()
+    );
+    if (this.currentDevice.id !== "full") this.deviceBtn.addClass("is-active");
+
+    // Copy path menu button
+    this.copyBtn = this.createToolbarBtn(
+      rightGroup, "copy", "Copy path / URL",
+      () => this.showCopyMenu()
     );
 
     rightGroup.createDiv({ cls: "html-preview-separator" });
@@ -694,18 +936,16 @@ class HtmlPreviewView extends FileView {
     rightGroup.createDiv({ cls: "html-preview-separator" });
 
     // Zoom
-    this.createToolbarBtn(rightGroup, "minus", "Zoom out", () => this.zoomOut());
+    this.createToolbarBtn(rightGroup, "minus", "Zoom out (Cmd+-)", () => this.zoomOut());
     this.zoomLabelEl = rightGroup.createSpan({ cls: "html-preview-zoom-label" });
     this.zoomLabelEl.textContent = `${this.zoom}%`;
     this.zoomLabelEl.addEventListener("click", () => this.zoomReset());
-    this.zoomLabelEl.setAttribute("aria-label", "Reset zoom");
-    this.createToolbarBtn(rightGroup, "plus", "Zoom in", () => this.zoomIn());
+    this.zoomLabelEl.setAttribute("aria-label", "Reset zoom (Cmd+0)");
+    this.createToolbarBtn(rightGroup, "plus", "Zoom in (Cmd+=)", () => this.zoomIn());
 
     rightGroup.createDiv({ cls: "html-preview-separator" });
 
-    this.createToolbarBtn(rightGroup, "external-link", "Open in browser", () => {
-      if (this.file) window.open(this.server.getFileUrl(this.file.path));
-    });
+    this.createToolbarBtn(rightGroup, "external-link", "Open in browser", () => this.openExternal());
   }
 
   private createToolbarBtn(
@@ -720,14 +960,129 @@ class HtmlPreviewView extends FileView {
     return btn;
   }
 
-  // [FIX #7] Navigate to a vault-relative path
-  private navigateToVaultPath(input: string): void {
-    // External URL: open in default browser
+  // ── Copy / device menus ──
+
+  private showCopyMenu(): void {
+    if (!this.file) return;
+    const menu = new Menu();
+    menu.addItem((item) =>
+      item.setTitle("Copy vault path")
+        .setIcon("file-text")
+        .onClick(() => this.copyVaultPath())
+    );
+    menu.addItem((item) =>
+      item.setTitle("Copy system path")
+        .setIcon("hard-drive")
+        .onClick(() => this.copySystemPath())
+    );
+    menu.addItem((item) =>
+      item.setTitle("Copy preview URL")
+        .setIcon("link")
+        .onClick(() => this.copyPreviewUrl())
+    );
+    menu.addItem((item) =>
+      item.setTitle("Copy file://… URL")
+        .setIcon("globe")
+        .onClick(() => this.copyFileUrl())
+    );
+    if (this.copyBtn) {
+      const rect = this.copyBtn.getBoundingClientRect();
+      menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+    }
+  }
+
+  private showDeviceMenu(): void {
+    const menu = new Menu();
+
+    let lastCategory: string | null = null;
+    for (const preset of DEVICE_PRESETS) {
+      if (lastCategory !== null && preset.category !== lastCategory) {
+        menu.addSeparator();
+      }
+      lastCategory = preset.category;
+
+      const isActive = this.currentDevice.id === preset.id;
+      menu.addItem((item) => {
+        item.setTitle(formatPresetLabel(preset))
+          .setIcon(preset.icon)
+          .setChecked(isActive)
+          .onClick(() => this.applyDevicePreset(preset));
+      });
+    }
+
+    if (this.deviceBtn) {
+      const rect = this.deviceBtn.getBoundingClientRect();
+      menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+    }
+  }
+
+  // ── Public actions (also used by commands) ──
+
+  copyVaultPath(): void {
+    if (!this.file) return;
+    void navigator.clipboard.writeText(this.file.path);
+    new Notice(`Copied vault path: ${this.file.path}`);
+  }
+
+  copySystemPath(): void {
+    if (!this.file) return;
+    const adapter = this.app.vault.adapter as FileSystemAdapter;
+    const fullPath = adapter.getFullPath(this.file.path);
+    void navigator.clipboard.writeText(fullPath);
+    new Notice(`Copied system path: ${fullPath}`);
+  }
+
+  copyPreviewUrl(): void {
+    if (!this.file) return;
+    const url = this.server.getFileUrl(this.file.path);
+    void navigator.clipboard.writeText(url);
+    new Notice("Copied preview URL");
+  }
+
+  copyFileUrl(): void {
+    if (!this.file) return;
+    const adapter = this.app.vault.adapter as FileSystemAdapter;
+    const fullPath = adapter.getFullPath(this.file.path);
+    const fileUrl = "file://" + fullPath.split(path.sep).join("/");
+    void navigator.clipboard.writeText(fileUrl);
+    new Notice("Copied file:// URL");
+  }
+
+  openExternal(): void {
+    if (!this.file) return;
+    window.open(this.server.getFileUrl(this.file.path));
+  }
+
+  printPreview(): void {
+    try {
+      this.iframeEl?.contentWindow?.print();
+    } catch (err) {
+      this.plugin.logger.error("Print failed:", err);
+      new Notice("Print failed");
+    }
+  }
+
+  closeTab(): void {
+    if (this.sourceModified && this.plugin.settings.warnUnsavedClose) {
+      new ConfirmModal(
+        this.app,
+        "Unsaved changes",
+        "You have unsaved changes in this preview. Discard them and close the tab?",
+        "Discard and close",
+        () => this.leaf.detach(),
+      ).open();
+    } else {
+      this.leaf.detach();
+    }
+  }
+
+  // ── Navigate to a vault-relative path ──
+
+  navigateToVaultPath(input: string): void {
     if (/^https?:\/\//i.test(input)) {
       window.open(input);
       return;
     }
-    // Vault-relative path
     const url = this.server.getFileUrl(input);
     this.loadingEl?.addClass("is-active");
     if (this.iframeEl) this.iframeEl.src = url;
@@ -737,39 +1092,42 @@ class HtmlPreviewView extends FileView {
 
   // ── View Mode Toggle ──
 
-  private toggleViewMode(): void {
+  async toggleViewMode(): Promise<void> {
     if (this.viewMode === "preview") {
-      // [FIX #6] Check unsaved before switching if already in source
-      this.switchToSource();
+      await this.switchToSource();
     } else {
       if (this.sourceModified) {
-        const proceed = confirm("You have unsaved changes. Discard and switch to preview?");
-        if (!proceed) return;
+        new ConfirmModal(
+          this.app,
+          "Unsaved changes",
+          "You have unsaved changes. Discard and switch to preview?",
+          "Discard",
+          () => void this.switchToPreview(),
+        ).open();
+      } else {
+        this.switchToPreview();
       }
-      this.switchToPreview();
     }
   }
 
-  private switchToSource(): void {
+  private async switchToSource(): Promise<void> {
     this.viewMode = "source";
     if (this.iframeWrapEl) this.iframeWrapEl.style.display = "none";
     if (this.sourceWrapEl) this.sourceWrapEl.style.display = "flex";
 
-    // [FIX #2] Create editor on first use
-    this.ensureEditor();
+    await this.ensureEditor();
 
-    // Reload source content from disk
     if (this.cmView && this.file) {
-      const adapter = this.app.vault.adapter as FileSystemAdapter;
-      const fullPath = adapter.getFullPath(this.file.path);
       try {
-        const content = fs.readFileSync(fullPath, "utf-8");
+        const content = await this.app.vault.read(this.file);
         this.cmView.dispatch({
           changes: { from: 0, to: this.cmView.state.doc.length, insert: content },
         });
         this.sourceModified = false;
         this.modifiedBadge?.removeClass("is-visible");
-      } catch { /* keep current */ }
+      } catch (err) {
+        this.plugin.logger.error("Reload source failed:", err);
+      }
     }
 
     if (this.modeToggleBtn) {
@@ -799,16 +1157,14 @@ class HtmlPreviewView extends FileView {
 
   private async saveSource(): Promise<void> {
     if (!this.cmView || !this.file) return;
-    const adapter = this.app.vault.adapter as FileSystemAdapter;
-    const fullPath = adapter.getFullPath(this.file.path);
     try {
-      fs.writeFileSync(fullPath, this.cmView.state.doc.toString(), "utf-8");
+      await this.app.vault.modify(this.file, this.cmView.state.doc.toString());
       this.sourceModified = false;
       this.modifiedBadge?.removeClass("is-visible");
       new Notice("Saved");
     } catch (err) {
       new Notice("Failed to save file");
-      console.error("[HTML Live Preview] Save error:", err);
+      this.plugin.logger.error("Save error:", err);
     }
   }
 
@@ -822,14 +1178,14 @@ class HtmlPreviewView extends FileView {
     this.updateNavButtons();
   }
 
-  private goBack(): void {
+  goBack(): void {
     if (this.navIndex <= 0) return;
     this.isNavigating = true;
     this.navIndex--;
     this.navigateTo(this.navHistory[this.navIndex]);
   }
 
-  private goForward(): void {
+  goForward(): void {
     if (this.navIndex >= this.navHistory.length - 1) return;
     this.isNavigating = true;
     this.navIndex++;
@@ -859,53 +1215,79 @@ class HtmlPreviewView extends FileView {
     textEl.textContent = decodeURIComponent(stripped) || "/";
   }
 
-  // ── Zoom ── [FIX #8] Persist zoom state
+  // ── Dimensions (zoom + device preset) ──
 
-  private applyZoom(): void {
-    if (!this.iframeEl) return;
+  private applyDimensions(): void {
+    if (!this.iframeEl || !this.iframeWrapEl) return;
+    const scale = this.zoom / 100;
+    const fixedSize = this.currentDevice.width !== null;
+
+    this.iframeWrapEl.classList.toggle("html-preview-iframe-wrap-fixed", fixedSize);
+
     if (this.zoom === 100) {
       this.iframeEl.style.transform = "";
-      this.iframeEl.style.width = "100%";
-      this.iframeEl.style.height = "100%";
+      this.iframeEl.style.transformOrigin = "";
     } else {
-      const scale = this.zoom / 100;
       this.iframeEl.style.transform = `scale(${scale})`;
       this.iframeEl.style.transformOrigin = "0 0";
+    }
+
+    if (fixedSize && this.currentDevice.width !== null && this.currentDevice.height !== null) {
+      this.iframeEl.style.width = `${this.currentDevice.width}px`;
+      this.iframeEl.style.height = `${this.currentDevice.height}px`;
+      this.iframeEl.style.flex = "0 0 auto";
+    } else if (this.zoom === 100) {
+      this.iframeEl.style.width = "100%";
+      this.iframeEl.style.height = "100%";
+      this.iframeEl.style.flex = "";
+    } else {
       this.iframeEl.style.width = `${100 / scale}%`;
       this.iframeEl.style.height = `${100 / scale}%`;
+      this.iframeEl.style.flex = "";
     }
+
     if (this.zoomLabelEl) this.zoomLabelEl.textContent = `${this.zoom}%`;
   }
 
-  private zoomIn(): void {
+  zoomIn(): void {
     this.zoom = Math.min(ZOOM_MAX, this.zoom + ZOOM_STEP);
-    this.applyZoom();
-    this.plugin.saveZoomState(this.zoom);
+    this.applyDimensions();
+    void this.plugin.saveZoomState(this.zoom);
   }
 
-  private zoomOut(): void {
+  zoomOut(): void {
     this.zoom = Math.max(ZOOM_MIN, this.zoom - ZOOM_STEP);
-    this.applyZoom();
-    this.plugin.saveZoomState(this.zoom);
+    this.applyDimensions();
+    void this.plugin.saveZoomState(this.zoom);
   }
 
-  private zoomReset(): void {
+  zoomReset(): void {
     this.zoom = 100;
-    this.applyZoom();
-    this.plugin.saveZoomState(this.zoom);
+    this.applyDimensions();
+    void this.plugin.saveZoomState(this.zoom);
+  }
+
+  applyDevicePreset(preset: DevicePreset): void {
+    this.currentDevice = preset;
+    this.applyDimensions();
+    if (this.deviceBtn) {
+      this.deviceBtn.setAttribute("aria-label", `Viewport: ${formatPresetLabel(preset)}`);
+      this.deviceBtn.toggleClass("is-active", preset.id !== "full");
+    }
   }
 
   // ── Auto Reload ──
 
-  private toggleAutoReload(): void {
+  toggleAutoReload(): void {
     this.autoReload = !this.autoReload;
     this.autoReloadBtn?.toggleClass("is-active", this.autoReload);
     this.autoReloadBtn?.setAttribute("aria-label", `Auto-reload: ${this.autoReload ? "ON" : "OFF"}`);
-    if (this.autoReload && this.file) {
-      this.startVaultWatch(this.file);
+    if (this.autoReload) {
+      this.startVaultWatch();
     } else {
       this.stopVaultWatch();
     }
+    new Notice(`Auto-reload ${this.autoReload ? "enabled" : "disabled"}`);
   }
 
   // ── Refresh ──
@@ -920,38 +1302,50 @@ class HtmlPreviewView extends FileView {
   private flashReloadIndicator(): void {
     if (!this.reloadIndicatorEl) return;
     this.reloadIndicatorEl.addClass("is-visible");
-    setTimeout(() => this.reloadIndicatorEl?.removeClass("is-visible"), 1200);
+    window.setTimeout(() => this.reloadIndicatorEl?.removeClass("is-visible"), 1200);
   }
 
-  // ── [FIX #1 + #9] Vault event watcher instead of fs.watch ──
-  // Uses Obsidian's own file monitoring. Naturally excludes .obsidian/, node_modules/.
-  // Only triggers for files Obsidian tracks in the vault.
+  // ── Dependency tracking ──
 
-  private startVaultWatch(file: TFile): void {
+  private async refreshDependencies(file: TFile): Promise<void> {
+    try {
+      const content = await this.app.vault.read(file);
+      this.dependencies = parseDependencies(content, file.path);
+      this.plugin.logger.debug(`Tracking ${this.dependencies.size} deps for ${file.path}`);
+    } catch (err) {
+      this.plugin.logger.error("Parse deps failed:", err);
+      this.dependencies = new Set([file.path]);
+    }
+  }
+
+  // ── Vault watch (uses dependency set) ──
+
+  private startVaultWatch(): void {
     this.stopVaultWatch();
     if (!this.autoReload) return;
 
-    const watchDir = path.dirname(file.path);
-
     this.vaultModifyRef = this.app.vault.on("modify", (changed: TAbstractFile) => {
-      if (!(changed instanceof TFile)) return;
-
-      const ext = path.extname(changed.path).toLowerCase();
-      if (!WATCHED_EXTENSIONS.has(ext)) return;
-
-      // Only reload for files in the same directory tree
-      const changedDir = path.dirname(changed.path);
-      if (!changedDir.startsWith(watchDir) && changedDir !== watchDir) return;
-
-      if (this.debounceTimer) clearTimeout(this.debounceTimer);
-      this.debounceTimer = setTimeout(() => {
-        const reloadType = CSS_EXTENSIONS.has(ext) ? "css" : "full";
-        this.server.broadcastReload(reloadType as "css" | "full");
-        this.flashReloadIndicator();
-      }, 300);
+      void this.handleVaultChange(changed);
     });
-
     this.registerEvent(this.vaultModifyRef);
+  }
+
+  private async handleVaultChange(changed: TAbstractFile): Promise<void> {
+    if (!(changed instanceof TFile)) return;
+    const ext = path.extname(changed.path).toLowerCase();
+    if (!WATCHED_EXTENSIONS.has(ext)) return;
+    if (!this.dependencies.has(changed.path)) return;
+
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = setTimeout(async () => {
+      const reloadType: "css" | "full" = CSS_EXTENSIONS.has(ext) ? "css" : "full";
+      this.server.broadcastReload(reloadType);
+      this.flashReloadIndicator();
+      // Re-parse dependencies if main HTML changed
+      if (this.file && changed.path === this.file.path) {
+        await this.refreshDependencies(this.file);
+      }
+    }, 300);
   }
 
   private stopVaultWatch(): void {
@@ -981,21 +1375,40 @@ class HtmlPreviewSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "HTML Live Preview" });
 
+    new Setting(containerEl).setHeading().setName("Sandbox");
+
+    containerEl.createEl("p", {
+      text: "Control which capabilities the iframe sandbox grants to previewed HTML. Disable for untrusted content.",
+      cls: "setting-item-description",
+    });
+
+    const sandboxOptions: { key: keyof SandboxFlags; name: string; desc: string }[] = [
+      { key: "scripts",       name: "Scripts",          desc: "Allow JavaScript execution." },
+      { key: "popups",        name: "Popups",           desc: "Allow window.open()." },
+      { key: "forms",         name: "Forms",            desc: "Allow form submission." },
+      { key: "modals",        name: "Modals",           desc: "Allow alert/confirm/prompt." },
+      { key: "downloads",     name: "Downloads",        desc: "Allow file downloads." },
+      { key: "topNavigation", name: "Top navigation",   desc: "Allow navigating the top window." },
+      { key: "pointerLock",   name: "Pointer lock",     desc: "Allow pointer lock API (games, canvas)." },
+    ];
+
+    for (const opt of sandboxOptions) {
+      new Setting(containerEl)
+        .setName(opt.name)
+        .setDesc(opt.desc)
+        .addToggle((t) =>
+          t.setValue(this.plugin.settings.sandboxFlags[opt.key]).onChange(async (v) => {
+            this.plugin.settings.sandboxFlags[opt.key] = v;
+            await this.plugin.saveSettings();
+          })
+        );
+    }
+
     new Setting(containerEl).setHeading().setName("Preview");
 
     new Setting(containerEl)
-      .setName("Allow scripts")
-      .setDesc("Allow JavaScript execution in HTML previews. Disable for untrusted content.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.allowScripts).onChange(async (v) => {
-          this.plugin.settings.allowScripts = v;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
       .setName("Default zoom")
-      .setDesc("Default zoom level for new preview tabs (30% - 300%).")
+      .setDesc("Default zoom level for new preview tabs (30% to 300%).")
       .addSlider((s) =>
         s.setLimits(30, 300, 10)
           .setValue(this.plugin.settings.defaultZoom)
@@ -1004,6 +1417,33 @@ class HtmlPreviewSettingTab extends PluginSettingTab {
             this.plugin.settings.defaultZoom = v;
             await this.plugin.saveSettings();
           })
+      );
+
+    new Setting(containerEl)
+      .setName("Default viewport")
+      .setDesc("Default device viewport for new preview tabs.")
+      .addDropdown((d) => {
+        for (const preset of DEVICE_PRESETS) {
+          d.addOption(preset.id, formatPresetLabel(preset));
+        }
+        d.setValue(this.plugin.settings.defaultDevice).onChange(async (v) => {
+          this.plugin.settings.defaultDevice = v;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Always open in new tab")
+      .setDesc(
+        "When you click an HTML file in the file explorer while another HTML preview is active, " +
+        "open it in a new tab instead of replacing the current preview. " +
+        "URL-bar navigation inside a single preview is unaffected."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.alwaysOpenInNewTab).onChange(async (v) => {
+          this.plugin.settings.alwaysOpenInNewTab = v;
+          await this.plugin.saveSettings();
+        })
       );
 
     new Setting(containerEl).setHeading().setName("Toolbar");
@@ -1023,12 +1463,36 @@ class HtmlPreviewSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Auto-reload on file changes")
       .setDesc(
-        "Automatically refresh when HTML, CSS, or JS files change. " +
+        "Automatically refresh when the HTML or any tracked dependency (CSS, JS, images linked from the HTML) changes. " +
         "CSS changes are hot-swapped without losing page state."
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.autoReload).onChange(async (v) => {
           this.plugin.settings.autoReload = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl).setHeading().setName("Editor");
+
+    new Setting(containerEl)
+      .setName("Warn before closing with unsaved changes")
+      .setDesc("Show a confirmation when Cmd+W is pressed and the source editor has unsaved changes.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.warnUnsavedClose).onChange(async (v) => {
+          this.plugin.settings.warnUnsavedClose = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl).setHeading().setName("Debug");
+
+    new Setting(containerEl)
+      .setName("Verbose logging")
+      .setDesc("Print debug messages to the developer console.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.verboseLogging).onChange(async (v) => {
+          this.plugin.settings.verboseLogging = v;
           await this.plugin.saveSettings();
         })
       );
@@ -1042,10 +1506,14 @@ class HtmlPreviewSettingTab extends PluginSettingTab {
 export default class HtmlLivePreviewPlugin extends Plugin {
   private server: StaticServer | null = null;
   settings: HtmlPreviewSettings = DEFAULT_SETTINGS;
+  logger!: Logger;
   private lastZoom = 100;
+  private htmlFilesCache: string[] | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
+
+    this.logger = new Logger(() => this.settings.verboseLogging);
 
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter)) {
@@ -1053,16 +1521,15 @@ export default class HtmlLivePreviewPlugin extends Plugin {
       return;
     }
 
-    // [FIX #8] Restore persisted zoom
     const saved = await this.loadData();
     if (saved?.lastZoom) this.lastZoom = saved.lastZoom;
 
-    this.server = new StaticServer(adapter.getBasePath());
+    this.server = new StaticServer(adapter.getBasePath(), this.logger);
     try {
       const port = await this.server.start();
       new Notice(`HTML Live Preview ready (port ${port})`);
     } catch (err) {
-      console.error("[HTML Live Preview] Server start failed:", err);
+      this.logger.error("Server start failed:", err);
       new Notice("HTML Live Preview: Failed to start local server.");
       return;
     }
@@ -1072,27 +1539,158 @@ export default class HtmlLivePreviewPlugin extends Plugin {
     );
     this.registerExtensions(EXTENSIONS, VIEW_TYPE);
 
-    this.addCommand({
-      id: "reload-html-preview",
-      name: "Reload HTML preview",
-      checkCallback: (checking) => {
-        const view = this.app.workspace.getActiveViewOfType(HtmlPreviewView);
-        if (view) {
-          if (!checking) view.refreshIframe();
-          return true;
-        }
-        return false;
-      },
-    });
+    // Invalidate HTML files cache on vault changes
+    this.registerEvent(this.app.vault.on("create", () => this.invalidateHtmlFilesCache()));
+    this.registerEvent(this.app.vault.on("delete", () => this.invalidateHtmlFilesCache()));
+    this.registerEvent(this.app.vault.on("rename", () => this.invalidateHtmlFilesCache()));
 
+    // Intercept HTML file navigation for the "always open in new tab" setting
+    this.installOpenFileInterceptor();
+
+    this.registerCommands();
     this.addSettingTab(new HtmlPreviewSettingTab(this.app, this));
+  }
+
+  // ── File-open interception (always open in new tab) ──
+  //
+  // We monkey-patch `WorkspaceLeaf.prototype.openFile` instead of listening
+  // on `workspace.on("file-open")`. The event fires *after* Obsidian has
+  // already loaded the file into the leaf, so a detect-and-revert approach
+  // causes visible flashing and races. Patching lets us intercept BEFORE
+  // the load happens, so an HTML preview tab never gets replaced in-place.
+
+  private installOpenFileInterceptor(): void {
+    const plugin = this;
+    const proto = WorkspaceLeaf.prototype as {
+      openFile: (this: WorkspaceLeaf, file: TFile, openState?: unknown) => Promise<void>;
+    };
+    const original = proto.openFile;
+    let unloaded = false;
+
+    const patched = async function (this: WorkspaceLeaf, file: TFile, openState?: unknown): Promise<void> {
+      // If we've been unloaded, skip our logic entirely. This matters when
+      // another plugin has patched on top of us: their saved "original" still
+      // points at this function, so it can keep getting called after us.
+      if (unloaded) {
+        return original.call(this, file, openState);
+      }
+      try {
+        if (plugin.settings.alwaysOpenInNewTab && file && (file.extension === "html" || file.extension === "htm")) {
+          const currentView = this.view;
+          const isReplacingHtml =
+            currentView instanceof HtmlPreviewView &&
+            currentView.file != null &&
+            currentView.file.path !== file.path;
+
+          if (isReplacingHtml) {
+            // If the target file is already open in another HTML preview leaf,
+            // focus that leaf instead of creating a duplicate tab.
+            const existingLeaf = plugin.findLeafShowingFile(file.path, this);
+            if (existingLeaf) {
+              plugin.app.workspace.setActiveLeaf(existingLeaf, { focus: true });
+              return;
+            }
+            // Otherwise open the new file in a fresh tab, leaving this one alone.
+            const newLeaf = plugin.app.workspace.getLeaf("tab");
+            return original.call(newLeaf, file, openState);
+          }
+        }
+      } catch (err) {
+        // Never let our logic break Obsidian's file opening for the whole app.
+        plugin.logger.error("openFile interceptor failed, falling back:", err);
+      }
+      return original.call(this, file, openState);
+    };
+
+    proto.openFile = patched;
+
+    // Restore original on unload, but ONLY if our patch is still on top.
+    // If another plugin has wrapped ours, restoring blindly would wipe their
+    // patch. In that case we leave the chain alone; the `unloaded` guard above
+    // makes our function a no-op so stale closure references stay harmless.
+    this.register(() => {
+      unloaded = true;
+      if (proto.openFile === patched) {
+        proto.openFile = original;
+      }
+    });
+  }
+
+  private findLeafShowingFile(filePath: string, excludeLeaf: WorkspaceLeaf): WorkspaceLeaf | null {
+    let found: WorkspaceLeaf | null = null;
+    this.app.workspace.iterateAllLeaves((l) => {
+      if (found || l === excludeLeaf) return;
+      const v = l.view;
+      if (v instanceof HtmlPreviewView && v.file && v.file.path === filePath) {
+        found = l;
+      }
+    });
+    return found;
   }
 
   async onunload(): Promise<void> {
     this.server?.stop();
   }
 
-  // [FIX #8] Persist zoom across sessions
+  // ── Commands ──
+
+  private registerCommands(): void {
+    this.addViewCommand("reload",            "Reload HTML preview",         (v) => v.refreshIframe());
+    this.addViewCommand("close-tab",         "Close HTML preview tab",      (v) => v.closeTab());
+    this.addViewCommand("toggle-mode",       "Toggle source / preview",     (v) => void v.toggleViewMode());
+    this.addViewCommand("toggle-auto-reload","Toggle auto-reload",          (v) => v.toggleAutoReload());
+    this.addViewCommand("zoom-in",           "Zoom in",                     (v) => v.zoomIn());
+    this.addViewCommand("zoom-out",          "Zoom out",                    (v) => v.zoomOut());
+    this.addViewCommand("zoom-reset",        "Reset zoom",                  (v) => v.zoomReset());
+    this.addViewCommand("nav-back",          "Navigate back",               (v) => v.goBack());
+    this.addViewCommand("nav-forward",       "Navigate forward",            (v) => v.goForward());
+    this.addViewCommand("open-external",     "Open in external browser",    (v) => v.openExternal());
+    this.addViewCommand("print",             "Print preview",               (v) => v.printPreview());
+    this.addViewCommand("copy-vault-path",   "Copy vault path",             (v) => v.copyVaultPath());
+    this.addViewCommand("copy-system-path",  "Copy system path",            (v) => v.copySystemPath());
+    this.addViewCommand("copy-preview-url",  "Copy preview URL",            (v) => v.copyPreviewUrl());
+    this.addViewCommand("copy-file-url",     "Copy file:// URL",            (v) => v.copyFileUrl());
+
+    // Viewport preset commands
+    for (const preset of DEVICE_PRESETS) {
+      this.addViewCommand(
+        `viewport-${preset.id}`,
+        `Viewport: ${formatPresetLabel(preset)}`,
+        (v) => v.applyDevicePreset(preset),
+      );
+    }
+  }
+
+  private addViewCommand(id: string, name: string, action: (view: HtmlPreviewView) => void): void {
+    this.addCommand({
+      id,
+      name,
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(HtmlPreviewView);
+        if (!view) return false;
+        if (!checking) action(view);
+        return true;
+      },
+    });
+  }
+
+  // ── HTML files cache (shared across views) ──
+
+  getHtmlFiles(): string[] {
+    if (this.htmlFilesCache) return this.htmlFilesCache;
+    this.htmlFilesCache = this.app.vault.getFiles()
+      .filter((f) => f.extension === "html" || f.extension === "htm")
+      .map((f) => f.path)
+      .sort();
+    return this.htmlFilesCache;
+  }
+
+  private invalidateHtmlFilesCache(): void {
+    this.htmlFilesCache = null;
+  }
+
+  // ── Persisted state ──
+
   async saveZoomState(zoom: number): Promise<void> {
     this.lastZoom = zoom;
     const data = (await this.loadData()) || {};
@@ -1101,10 +1699,21 @@ export default class HtmlLivePreviewPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = { ...DEFAULT_SETTINGS, ...(await this.loadData()) };
+    const data = (await this.loadData()) || {};
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...data,
+      sandboxFlags: { ...DEFAULT_SETTINGS.sandboxFlags, ...(data.sandboxFlags ?? {}) },
+    };
+    // Migrate legacy `allowScripts` setting
+    if (typeof data.allowScripts === "boolean" && !data.sandboxFlags) {
+      this.settings.sandboxFlags.scripts = data.allowScripts;
+    }
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    const data = (await this.loadData()) || {};
+    Object.assign(data, this.settings);
+    await this.saveData(data);
   }
 }
